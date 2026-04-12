@@ -288,11 +288,28 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
  *   - wake consumers correctly
  *   - stop cleanly if shutdown begins
  */
+
 int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+    pthread_mutex_lock(&buffer->mutex);
+
+    while (buffer->count == LOG_BUFFER_CAPACITY && !buffer->shutting_down) {
+        pthread_cond_wait(&buffer->not_full, &buffer->mutex);
+    }
+
+    if (buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    buffer->items[buffer->tail] = *item;
+    buffer->tail = (buffer->tail + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count++;
+
+    pthread_cond_signal(&buffer->not_empty);
+    pthread_mutex_unlock(&buffer->mutex);
+
+    return 0;
 }
 
 /*
@@ -304,11 +321,28 @@ int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
  *   - return a useful status when shutdown is in progress
  *   - avoid races with producers and shutdown
  */
+
 int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+    pthread_mutex_lock(&buffer->mutex);
+
+    while (buffer->count == 0 && !buffer->shutting_down) {
+        pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
+    }
+
+    if (buffer->count == 0 && buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    *item = buffer->items[buffer->head];
+    buffer->head = (buffer->head + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count--;
+
+    pthread_cond_signal(&buffer->not_full);
+    pthread_mutex_unlock(&buffer->mutex);
+
+    return 0;
 }
 
 /*
@@ -322,9 +356,35 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
  */
 void *logging_thread(void *arg)
 {
-    (void)arg;
+    bounded_buffer_t *buffer = (bounded_buffer_t *)arg;
+    log_item_t item;
+
+    while (1) {
+        if (bounded_buffer_pop(buffer, &item) != 0) {
+            break;
+        }
+
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s.log",
+                 LOG_DIR, item.container_id);
+
+        FILE *log_file = fopen(path, "a");
+        if (!log_file) {
+            perror("fopen");
+            continue;
+        }
+
+        fprintf(log_file, "%.*s",
+                (int)item.length,
+                item.data);
+
+        fclose(log_file);
+    }
+
     return NULL;
 }
+
+      
 
 /*
  * TODO:
@@ -339,7 +399,38 @@ void *logging_thread(void *arg)
  */
 int child_fn(void *arg)
 {
-    (void)arg;
+    child_config_t *cfg = (child_config_t *)arg;
+
+    /* Set hostname (UTS namespace) */
+    sethostname(cfg->id, strlen(cfg->id));
+
+    /* Redirect stdout and stderr to pipe */
+    dup2(cfg->log_write_fd, STDOUT_FILENO);
+    dup2(cfg->log_write_fd, STDERR_FILENO);
+    close(cfg->log_write_fd);
+
+    /* Change root filesystem */
+    if (chroot(cfg->rootfs) != 0) {
+        perror("chroot");
+        return 1;
+    }
+
+    if (chdir("/") != 0) {
+        perror("chdir");
+        return 1;
+    }
+
+    /* Mount /proc */
+    if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
+        perror("mount /proc");
+        return 1;
+    }
+
+    /* Execute command */
+    execl("/bin/ash", "ash", "-c", cfg->command, NULL);
+
+    /* If exec fails */
+    perror("exec");
     return 1;
 }
 
@@ -400,10 +491,13 @@ static int run_supervisor(const char *rootfs)
     pthread_mutex_init(&ctx.metadata_lock, NULL);
     bounded_buffer_init(&ctx.log_buffer);
 
-    pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx);
+    pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx.log_buffer);
 
     ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
 
+if (ctx.monitor_fd < 0) {
+    perror("open monitor");
+}
     ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
 
     unlink(CONTROL_PATH);
@@ -440,12 +534,23 @@ static int run_supervisor(const char *rootfs)
             strcpy(cfg->command, req.command);
             cfg->log_write_fd = pipefd[1];
 
-            char *stack = malloc(STACK_SIZE);
+            
 
-            pid_t pid = clone(child_fn,
-                              stack + STACK_SIZE,
-                              CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
-                              cfg);
+            void *stack = malloc(STACK_SIZE);
+if (!stack) {
+    perror("malloc");
+    return -1;
+}
+
+pid_t pid = clone(child_fn,
+                  stack + STACK_SIZE,
+                  SIGCHLD | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS,
+                  cfg);
+
+if (pid < 0) {
+    perror("clone");
+    return -1;
+}
 
             close(pipefd[1]);
 
@@ -495,12 +600,23 @@ static int run_supervisor(const char *rootfs)
             strcpy(cfg->command, req.command);
             cfg->log_write_fd = pipefd[1];
 
-            char *stack = malloc(STACK_SIZE);
+            
 
-            pid_t pid = clone(child_fn,
-                              stack + STACK_SIZE,
-                              CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD,
-                              cfg);
+            void *stack = malloc(STACK_SIZE);
+if (!stack) {
+    perror("malloc");
+    return -1;
+}
+
+pid_t pid = clone(child_fn,
+                  stack + STACK_SIZE,
+                  SIGCHLD | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS,
+                  cfg);
+
+if (pid < 0) {
+    perror("clone");
+    return -1;
+}
 
             close(pipefd[1]);
 

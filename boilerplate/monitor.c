@@ -201,7 +201,7 @@ static void timer_callback(struct timer_list *t)
     mutex_unlock(&monitor_lock);
 
     /* Restart timer */
-    mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
+   //mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
 }
 
 /* ---------------------------------------------------------------
@@ -334,7 +334,7 @@ static int __init monitor_init(void)
     }
 
     timer_setup(&monitor_timer, timer_callback, 0);
-    mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
+   //mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
 
     printk(KERN_INFO "[container_monitor] Module loaded. Device: /dev/%s\n", DEVICE_NAME);
     return 0;
